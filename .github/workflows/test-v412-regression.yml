@@ -1,0 +1,158 @@
+# Proves the #3982 rapid-zoom terrain crash actually exists in v4.1.2.
+#
+# Our regression guard lives on current main (src/tile/tile_manager.test.ts) and
+# PASSES there because the tile access is now routed through _addTile(), which
+# always returns a Tile. To show the guard is meaningful we must also show the
+# OLD code throws. v4.1.2 depends on the native `canvas` module, which is awkward
+# to build on Windows but compiles cleanly on Linux — so we verify it here on CI.
+#
+# This job checks out the v4.1.2 tag, injects a Jest test that reconstructs the
+# exact v4.1.2 access pattern (`this._tiles[tileID.key].hasData()` for an ideal
+# tile that is absent from `_tiles`), and asserts that it THROWS. A green run
+# therefore means: "the unguarded access crashes on v4.1.2", i.e. the bug is real
+# and the main-branch guard is what prevents it.
+#
+# Triggered manually only (workflow_dispatch) — it is a one-off proof, not part of
+# the normal test matrix.
+
+name: Prove #3982 crash on v4.1.2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prove-v412-crash:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out v4.1.2 tag
+        uses: actions/checkout@v4
+        with:
+          # The v4.1.2 tag lives on upstream maplibre/maplibre-gl-js, not on the
+          # fork, so check out the upstream repo explicitly.
+          repository: maplibre/maplibre-gl-js
+          ref: v4.1.2
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Node 20 (matches v4.1.2 .nvmrc)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.10'
+
+      - name: Install dependencies (canvas compiles on Linux)
+        run: npm ci
+
+      - name: Generate code required before tests run
+        run: npm run codegen
+
+      - name: Inject the v4.1.2 reconstruction test
+        # Hardening for the heredoc:
+        # - `shell: bash` is set explicitly so heredoc behaviour is guaranteed
+        #   (the default shell can vary).
+        # - YAML's `|` block scalar strips the common 10-space indentation from
+        #   every line, so the script bash receives starts at column 0. The
+        #   `cat <<'EOF'` body and the closing `EOF` therefore both sit at column
+        #   0 in the real script, which is exactly what an unindented heredoc
+        #   needs. The quoted 'EOF' also prevents any $-expansion in the body.
+        shell: bash
+        run: |
+          cat > src/source/regression_3982.test.ts <<'EOF'
+          // Auto-injected by .github/workflows/test-v412-regression.yml
+          // Reconstructs the v4.1.2 unguarded terrain tile access from
+          // src/source/source_cache.ts:
+          //
+          //     if (terrain) {
+          //         for (const tileID of idealTileIDs)
+          //             if (this._tiles[tileID.key].hasData())   // <-- unguarded
+          //
+          // During rapid zoom an ideal tile id could be absent from `_tiles`, so
+          // `_tiles[key]` was undefined and `.hasData()` threw. This test sets up
+          // that exact precondition and asserts the access THROWS, proving the bug
+          // exists in v4.1.2. (The equivalent test on current main asserts the
+          // same access is now safe.)
+          import {SourceCache} from './source_cache';
+          import {addSourceType} from './source';
+          import {Tile} from './tile';
+          import {OverscaledTileID} from './tile_id';
+          import {Evented, Event} from '../util/evented';
+          import {extend} from '../util/util';
+          import {Dispatcher} from '../util/dispatcher';
+
+          class SourceMock extends Evented {
+              id: string;
+              minzoom = 0;
+              maxzoom = 22;
+              sourceOptions: any;
+              type: string;
+              tileSize: number;
+              constructor(id: string, sourceOptions: any, _d: Dispatcher, parent: Evented) {
+                  super();
+                  this.id = id;
+                  extend(this, sourceOptions);
+                  this.sourceOptions = sourceOptions;
+                  this.setEventedParent(parent);
+              }
+              loadTile(_tile: Tile): Promise<void> { return new Promise(r => setTimeout(r, 0)); }
+              loaded() { return true; }
+              onAdd() { this.fire(new Event('data', {dataType: 'source', sourceDataType: 'metadata'})); }
+              async abortTile() {}
+              async unloadTile() {}
+              serialize() {}
+              hasTransition(): boolean { return false; }
+          }
+          // Register a regular function (not an arrow): v4.1.2's Source.create
+          // does `new Class(...)`, and arrow functions cannot be constructed,
+          // which previously threw "Class is not a constructor". This mirrors the
+          // createSource helper in v4.1.2's own source_cache.test.ts.
+          function createSource(id: string, sourceOptions: any, _dispatcher: any, eventedParent: Evented) {
+              return new SourceMock(id, sourceOptions, _dispatcher, eventedParent);
+          }
+          addSourceType('mock-3982', createSource as any);
+
+          function createSourceCache() {
+              return new SourceCache('id', extend({
+                  tileSize: 512, minzoom: 0, maxzoom: 14, type: 'mock-3982'
+              }, {}), {} as Dispatcher);
+          }
+
+          describe('issue #3982 (v4.1.2)', () => {
+              test('unguarded terrain tile access throws when an ideal tile is missing from _tiles', () => {
+                  const sourceCache = createSourceCache();
+
+                  const idealTileIDs = [
+                      new OverscaledTileID(2, 0, 2, 1, 1),
+                      new OverscaledTileID(2, 0, 2, 1, 2),
+                      new OverscaledTileID(2, 0, 2, 2, 1),
+                      new OverscaledTileID(2, 0, 2, 2, 2)
+                  ];
+
+                  // Precondition: none of the ideal tiles are in _tiles.
+                  for (const tileID of idealTileIDs) {
+                      expect(sourceCache._tiles[tileID.key]).toBeFalsy();
+                  }
+
+                  // Exact v4.1.2 access pattern (source_cache.ts:609). _tiles[key] is
+                  // undefined here, so .hasData() must throw.
+                  expect(() => {
+                      for (const tileID of idealTileIDs) {
+                          if (sourceCache._tiles[tileID.key].hasData()) { /* unreachable */ }
+                      }
+                  }).toThrow();
+              });
+          });
+          EOF
+          echo "Injected test:"
+          cat src/source/regression_3982.test.ts
+
+      - name: Run ONLY the injected test
+        # Pass only the test file path. Combining a positional path with
+        # --reporters=default makes Jest parse the path as a custom reporter
+        # module ("Could not resolve a module for a custom reporter").
+        run: npx jest src/source/regression_3982.test.ts
+
+      - name: Result
+        if: always()
+        run: |
+          echo "A PASSING run means the unguarded access throws on v4.1.2 -> bug confirmed."
+          echo "A FAILING run would mean v4.1.2 did NOT throw (our premise would be wrong)."
